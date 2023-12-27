@@ -1,10 +1,9 @@
+#include <curl/curl.h>
+#include <gumbo.h>
 #include <stdio.h>
 #include <string.h>
 #include <time.h>
 #include <xlsxio_read.h>
-
-#define ADJUST_YEAR(year) ((year) + 1900)
-#define ADJUST_MONTH(month) ((month) + 1)
 
 struct DataPointKeyIndex {
     int date;
@@ -15,6 +14,11 @@ struct DataPointKeyIndex {
     int rainfall;
     int snowDepth;
     int description;
+};
+
+struct ResponseChunksBuffer {
+    char* memory;
+    size_t size;
 };
 
 const char* EXCEL_FILE_NAME;
@@ -33,6 +37,13 @@ void readWeatherExcel();
 struct tm parseExcelDate(const char* dateString);
 void addDayToTm(struct tm* date);
 time_t presentMonthTime();
+
+void requestWeatherData();
+size_t curlWriteFunction(void* contents, size_t size, size_t nmemb, void* userp);
+int adjustMonth(int month);
+int adjustYear(int year);
+void parseAndWrite(const char* html);
+void searchNodes(GumboNode* node);
 
 void readConfigExcel() {
     xlsxioreader xlsxioReader;
@@ -116,11 +127,13 @@ void readWeatherExcel() {
         exit(1);
     }
 
-    int col = 0;
+    int col;
     char* value;
     char* lastValue;
     xlsxioreadersheet sheet = xlsxioread_sheet_open(xlsxioReader, EXCEL_SHEET_NAME, XLSXIOREAD_SKIP_EMPTY_ROWS);
+    xlsxioread_sheet_next_row(sheet);
     while (xlsxioread_sheet_next_row(sheet)) {
+        col = 0;
         while ((value = xlsxioread_sheet_next_cell(sheet)) != NULL) {
             if (col == DATE_COL_EXCEL_INDEX) {
                 free(lastValue);
@@ -180,9 +193,110 @@ time_t presentMonthTime() {
     return mktime(presentMonthDate);
 }
 
+void requestWeatherData() {
+    CURL* curl = curl_easy_init();
+    if (!curl) {
+        fprintf(stderr, "Error initializing curl\n");
+        exit(1);
+    }
+
+    struct ResponseChunksBuffer responseChunksBuffer = {
+        .memory = NULL,
+        .size = 0};
+    curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, curlWriteFunction);
+    curl_easy_setopt(curl, CURLOPT_WRITEDATA, (void*)&responseChunksBuffer);
+
+    time_t monthTime = FIRST_MONTH_TIME;
+    while (monthTime <= PRESENT_MONTH_TIME) {
+        struct tm* monthDate = localtime(&monthTime);
+        char url[256];
+        snprintf(url, sizeof(url), "https://freemeteo.ro/vremea/bucuroaia/istoric/istoric-lunar/?gid=683499&station=4621&month=%d&year=%d&language=romanian&country=romania", adjustMonth(monthDate->tm_mon), adjustYear(monthDate->tm_year));
+
+        curl_easy_setopt(curl, CURLOPT_URL, url);
+        CURLcode res = curl_easy_perform(curl);
+
+        if (res != CURLE_OK) {
+            fprintf(stderr, "CURL request failed: %s\n", curl_easy_strerror(res));
+            free(responseChunksBuffer.memory);
+            exit(1);
+        }
+
+        parseAndWrite(responseChunksBuffer.memory);
+
+        free(responseChunksBuffer.memory);
+        responseChunksBuffer.size = 0;
+
+        monthTime += 86400 * 300;
+    }
+
+    curl_easy_cleanup(curl);
+}
+
+size_t curlWriteFunction(void* contents, size_t size, size_t nmemb, void* userp) {
+    size_t sizeAdd = size * nmemb;
+
+    struct ResponseChunksBuffer* buffer = (struct ResponseChunksBuffer*)userp;
+    char* ptr = realloc(buffer->memory, buffer->size + sizeAdd + 1);
+    buffer->memory = ptr;
+    memcpy(&(buffer->memory[buffer->size]), contents, sizeAdd);
+    buffer->size += sizeAdd;
+    buffer->memory[buffer->size] = 0;
+
+    return sizeAdd;
+}
+
+int adjustMonth(int month) {
+    return month + 1;
+}
+
+int adjustYear(int year) {
+    return year + 1900;
+}
+
+void searchNodes(GumboNode* node) {
+    if (node->type != GUMBO_NODE_ELEMENT) {
+        return;
+    }
+
+    GumboAttribute* attr;
+    if (node->v.element.tag == GUMBO_TAG_TR && (attr = gumbo_get_attribute(&node->v.element.attributes, "data-day"))) {
+        GumboVector* tdNodes = &node->v.element.children;
+
+        // start with 1 and increment by 2 to jump over nodes of type GUMBO_NODE_WHITESPACE
+        for (unsigned int i = 1; i < tdNodes->length; i += 2) {
+            GumboNode* tdNode = tdNodes->data[i];
+            GumboNode* textNode;
+
+            if (i == 1) {
+                GumboNode* anchorNode = tdNode->v.element.children.data[0];
+                textNode = anchorNode->v.element.children.data[0];
+                printf("%s\n", textNode->v.text.text);
+            } else if (i != 17) {
+                textNode = tdNode->v.element.children.data[0];
+                printf("%s\n", textNode->v.text.text);
+            }
+        }
+
+        printf("\n");
+    }
+
+    GumboVector* children = &node->v.element.children;
+    for (unsigned int i = 0; i < children->length; ++i) {
+        searchNodes(children->data[i]);
+    }
+}
+
+void parseAndWrite(const char* html) {
+    GumboOutput* output = gumbo_parse(html);
+    searchNodes(output->root);
+    gumbo_destroy_output(&kGumboDefaultOptions, output);
+    free(output);
+}
+
 int main() {
     readConfigExcel();
     readWeatherExcel();
+    requestWeatherData();
 
     free((void*)EXCEL_FILE_NAME);
     free((void*)EXCEL_SHEET_NAME);
