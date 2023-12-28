@@ -1,6 +1,5 @@
 #include <curl/curl.h>
 #include <gumbo.h>
-#include <xlsxio_read.h>
 
 #include <chrono>
 #include <cstring>
@@ -10,6 +9,7 @@
 #include <string>
 #include <variant>
 #include <vector>
+#include <xlnt/xlnt.hpp>
 
 struct Error {
     const std::string msg;
@@ -22,7 +22,7 @@ struct Error {
     void print() const {
         const char redColor[6] = "\033[31m";
         const char resetColor[6] = "\033[0m";
-        std::cerr << redColor << "Error: " << msg << resetColor << std::endl;
+        std::cerr << redColor << "Error : " << msg << resetColor << std::endl;
     }
 };
 
@@ -59,6 +59,11 @@ struct NewDataTime {
     const int firstMonthDay;
 };
 
+struct NewDataParams {
+    const NewDataTime newDataTime;
+    const int startRowIdx;
+};
+
 struct ResponseChunksBuffer {
     std::vector<char> buffer;
 
@@ -80,62 +85,62 @@ struct ResponseChunksBuffer {
 };
 
 Result<ExcelConfig> getExcelConfig();
-Result<int> stoiDateColIdx(char* val);
+Result<int> stoiDateColIdx(std::string val);
 
-Result<NewDataTime> getNewDataTime(const ExcelConfig& excelConfig);
+Result<NewDataParams> getNewDataParams(const ExcelConfig& excelConfig);
 Result<NewDataTime> parseExcelDateStr(const std::string& dateStr);
 time_t getPresentMonthTime();
 
-Result<> requestNewWeatherData(NewDataTime newDataTime);
+Result<> requestNewData(NewDataParams newDataParams);
 size_t curlWriteFunction(void* contents, size_t size, size_t nmemb, void* userp);
-void parseHtmlAndWrite(const char* html);
+void parseHtml(const char* html);
 void searchNodes(GumboNode* node);
 
 Result<ExcelConfig> getExcelConfig() {
-    xlsxioreader xlsxioReader;
-    if ((xlsxioReader = xlsxioread_open("config.xlsx")) == NULL) {
-        return Error{"Failed to open config.xlsx"};
+    xlnt::workbook wb;
+    try {
+        wb.load("config.xlsx");
+    } catch (const xlnt::exception& err) {
+        return Error{"Failed to open config.xlsx : " + std::string(err.what())};
+    }
+
+    xlnt::worksheet ws;
+    try {
+        ws = wb.sheet_by_title("Config");
+    } catch (const xlnt::exception& err) {
+        return Error{"Failed to get sheet Config : " + std::string(err.what())};
     }
 
     std::string fileName;
     std::string sheetName;
     int dateColIdx;
-
-    int col = 0;
-    char* val;
-    xlsxioreadersheet sheet = xlsxioread_sheet_open(xlsxioReader, "Config", XLSXIOREAD_SKIP_EMPTY_ROWS);
-    xlsxioread_sheet_next_row(sheet);
-    xlsxioread_sheet_next_row(sheet);
-    while ((val = xlsxioread_sheet_next_cell(sheet)) != NULL) {
-        switch (col) {
-            case 0:
-                fileName = val;
-                break;
-            case 1:
-                sheetName = val;
-                break;
-            case 2:
-                dateColIdx = stoiDateColIdx(val).result();
-                break;
-        }
-        xlsxioread_free(val);
-        col++;
+    try {
+        fileName = ws.cell(xlnt::cell_reference("A2")).to_string();
+    } catch (const xlnt::exception& err) {
+        return Error{"Failed to get EXCEL_FILE_NAME value : " + std::string(err.what())};
+    }
+    try {
+        sheetName = ws.cell(xlnt::cell_reference("B2")).to_string();
+    } catch (const xlnt::exception& err) {
+        return Error{"Failed to get EXCEL_SHEET_NAME value : " + std::string(err.what())};
+    }
+    try {
+        dateColIdx = stoiDateColIdx(ws.cell(xlnt::cell_reference("C2")).to_string()).result();
+    } catch (const xlnt::exception& err) {
+        return Error{"Failed to get EXCEL_DATE_COL_IDX value : " + std::string(err.what())};
     }
 
     if (fileName.empty()) {
-        return Error{"Failed to  get EXCEL_FILE_NAME value"};
+        return Error{"EXCEL_FILE_NAME value cannot be empty"};
     }
     if (sheetName.empty()) {
-        return Error{"Failed to get EXCEL_SHEET_NAME value"};
+        return Error{"EXCEL_SHEET_NAME value cannot be empty"};
     }
-
-    xlsxioread_sheet_close(sheet);
-    xlsxioread_close(xlsxioReader);
 
     return ExcelConfig{fileName + ".xlsx", sheetName, dateColIdx};
 }
 
-Result<int> stoiDateColIdx(char* val) {
+Result<int> stoiDateColIdx(std::string val) {
     try {
         return std::stoi(val);
     } catch (const std::invalid_argument& err) {
@@ -143,37 +148,36 @@ Result<int> stoiDateColIdx(char* val) {
     }
 }
 
-Result<NewDataTime> getNewDataTime(const ExcelConfig& excelConfig) {
-    xlsxioreader xlsxioReader;
-    if ((xlsxioReader = xlsxioread_open(excelConfig.fileName.c_str())) == NULL) {
-        return Error{"Failed to open " + excelConfig.fileName};
+Result<NewDataParams> getNewDataParams(const ExcelConfig& excelConfig) {
+    xlnt::workbook wb;
+    try {
+        wb.load(excelConfig.fileName);
+    } catch (const xlnt::exception& err) {
+        return Error{"Failed to open " + excelConfig.fileName + " : " + std::string(err.what())};
     }
 
-    int col;
-    char* val;
-    char* lastDateVal = nullptr;
-    xlsxioreadersheet sheet = xlsxioread_sheet_open(xlsxioReader, excelConfig.sheetName.c_str(), XLSXIOREAD_SKIP_EMPTY_ROWS);
-    xlsxioread_sheet_next_row(sheet);
-    while (xlsxioread_sheet_next_row(sheet)) {
-        col = 0;
-        while ((val = xlsxioread_sheet_next_cell(sheet)) != NULL) {
-            if (col == excelConfig.dateColIdx) {
-                free(lastDateVal);
-                lastDateVal = strdup(val);
-                break;
-            }
-            xlsxioread_free(val);
-            col++;
+    xlnt::worksheet ws;
+    try {
+        ws = wb.sheet_by_title(excelConfig.sheetName);
+    } catch (const xlnt::exception& err) {
+        return Error{"Failed to open sheet " + excelConfig.sheetName + " : " + std::string(err.what())};
+    }
+
+    std::string lastDateStr;
+    int startingRowIdx = 1;
+    for (auto row : ws.rows()) {
+        if (!row[excelConfig.dateColIdx].to_string().empty()) {
+            lastDateStr = row[excelConfig.dateColIdx].to_string();
         }
+        ++startingRowIdx;
     }
 
-    if (lastDateVal == nullptr) {
-        return Error{"Failed to get last date value"};
+    if (lastDateStr.empty()) {
+        return Error{"Last date value not found"};
     }
 
-    xlsxioread_sheet_close(sheet);
-    xlsxioread_close(xlsxioReader);
-    return parseExcelDateStr(lastDateVal).result();
+    NewDataTime newDataTime = parseExcelDateStr(lastDateStr).result();
+    return NewDataParams{newDataTime, startingRowIdx};
 }
 
 Result<NewDataTime> parseExcelDateStr(const std::string& dateStr) {
@@ -181,7 +185,7 @@ Result<NewDataTime> parseExcelDateStr(const std::string& dateStr) {
     std::istringstream ss(dateStr);
     ss >> std::get_time(&date, "%d.%m.%Y");
     if (ss.fail()) {
-        return Error{"Failed to parse date: " + dateStr};
+        return Error{"Failed to parse date : " + dateStr};
     }
 
     std::time_t firstMonthTime = std::mktime(&date) + (24 * 60 * 60);
@@ -204,7 +208,7 @@ time_t getPresentMonthTime() {
     return std::mktime(&now);
 }
 
-Result<> requestNewWeatherData(NewDataTime newDataTime) {
+Result<> requestNewData(NewDataParams newDataParams) {
     CURL* curl = curl_easy_init();
     if (!curl) {
         return Error{"Failed to initialize CURL"};
@@ -214,8 +218,8 @@ Result<> requestNewWeatherData(NewDataTime newDataTime) {
     curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, curlWriteFunction);
     curl_easy_setopt(curl, CURLOPT_WRITEDATA, &responseChunksBuffer);
 
-    time_t monthTime = newDataTime.firstMonthTime;
-    while (monthTime <= newDataTime.presentMonthTime) {
+    time_t monthTime = newDataParams.newDataTime.firstMonthTime;
+    while (monthTime <= newDataParams.newDataTime.presentMonthTime) {
         struct tm* monthDate = localtime(&monthTime);
         std::ostringstream urlStream;
         urlStream << "https://freemeteo.ro/vremea/bucuroaia/istoric/istoric-lunar/?gid=683499&station=4621"
@@ -227,10 +231,10 @@ Result<> requestNewWeatherData(NewDataTime newDataTime) {
         CURLcode res = curl_easy_perform(curl);
 
         if (res != CURLE_OK) {
-            return Error{"CURL request failed: " + std::string(curl_easy_strerror(res))};
+            return Error{"CURL request failed : " + std::string(curl_easy_strerror(res))};
         }
 
-        parseHtmlAndWrite(responseChunksBuffer.data());
+        parseHtml(responseChunksBuffer.data());
         responseChunksBuffer.clear();
 
         monthTime += (30 * 24 * 60 * 60);
@@ -248,26 +252,28 @@ size_t curlWriteFunction(void* contents, size_t size, size_t nmemb, void* userp)
     return addSize;
 }
 
-void parseHtmlAndWrite(const char* html) {
+void parseHtml(const char* html) {
     GumboOutput* output = gumbo_parse(html);
     searchNodes(output->root);
     gumbo_destroy_output(&kGumboDefaultOptions, output);
 }
 
 void searchNodes(GumboNode* node) {
-    if (node->type != GUMBO_NODE_ELEMENT) {
+    if (!node || node->type != GUMBO_NODE_ELEMENT) {
         return;
     }
 
-    GumboAttribute* attr;
-    if (node->v.element.tag == GUMBO_TAG_TR && (attr = gumbo_get_attribute(&node->v.element.attributes, "data-day"))) {
-        GumboVector* tdNodes = &node->v.element.children;
+    if (node->v.element.tag == GUMBO_TAG_TR) {
+        GumboAttribute* attr = gumbo_get_attribute(&node->v.element.attributes, "data-day");
+        if (!attr) {
+            return;
+        }
 
+        GumboVector* tdNodes = &node->v.element.children;
         // start with 1 and increment by 2 to jump over nodes of type GUMBO_NODE_WHITESPACE
         for (unsigned int i = 1; i < tdNodes->length; i += 2) {
             GumboNode* tdNode = static_cast<GumboNode*>(tdNodes->data[i]);
             GumboNode* textNode;
-
             if (i == 1) {
                 GumboNode* anchorNode = static_cast<GumboNode*>(tdNode->v.element.children.data[0]);
                 textNode = static_cast<GumboNode*>(anchorNode->v.element.children.data[0]);
@@ -295,14 +301,14 @@ int main() {
     std::cout << excelConfig.dateColIdx << std::endl
               << std::endl;
 
-    NewDataTime newDataTime = getNewDataTime(excelConfig).result();
+    NewDataParams newDataParams = getNewDataParams(excelConfig).result();
 
-    std::cout << newDataTime.firstMonthTime << std::endl;
-    std::cout << newDataTime.presentMonthTime << std::endl;
-    std::cout << newDataTime.firstMonthDay << std::endl
+    std::cout << newDataParams.newDataTime.firstMonthTime << std::endl;
+    std::cout << newDataParams.newDataTime.presentMonthTime << std::endl;
+    std::cout << newDataParams.newDataTime.firstMonthDay << std::endl
               << std::endl;
 
-    requestNewWeatherData(newDataTime).result();
+    requestNewData(newDataParams).result();
 
     return 0;
 }
