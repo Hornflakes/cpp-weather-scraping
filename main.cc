@@ -1,6 +1,7 @@
 #include <curl/curl.h>
 #include <gumbo.h>
 
+#include <algorithm>
 #include <chrono>
 #include <cstring>
 #include <iomanip>
@@ -50,18 +51,18 @@ struct Result {
 struct ExcelConfig {
     const std::string fileName;
     const std::string sheetName;
-    const int dateColIdx;
+    const std::string dateColumnLetter;
 };
 
 struct NewDataTime {
     const time_t firstMonthTime;
     const time_t presentMonthTime;
-    const int firstMonthDay;
+    const unsigned short firstMonthDay;
 };
 
 struct NewDataParams {
     const NewDataTime newDataTime;
-    const int startRowIdx;
+    const unsigned short startRowIdx;
 };
 
 struct WeatherDataPoint {
@@ -96,17 +97,19 @@ struct ResponseChunksBuffer {
 };
 
 Result<ExcelConfig> getExcelConfig();
-Result<int> stoiDateColIdx(std::string val);
 
-Result<NewDataParams> getNewDataParams(const ExcelConfig& excelConfig);
-Result<NewDataTime> parseExcelDateStr(const std::string& dateStr);
+Result<NewDataParams> getNewDataParams(ExcelConfig excelConfig);
+Result<NewDataTime> parseExcelDateStr(const std::string dateStr);
 time_t getPresentMonthTime();
 
 Result<std::vector<WeatherDataPoint>> getWeatherData(NewDataParams newDataParams);
 size_t curlWriteFunction(void* contents, size_t size, size_t nmemb, void* userp);
-Result<std::vector<WeatherDataPoint>> getMonthlyWeatherData(const char* html);
-void parseHtml(GumboNode* node, std::vector<WeatherDataPoint>& monthlyWeatherData);
+Result<std::vector<WeatherDataPoint>> getMonthlyWeatherData(const char* html, bool firstMonth, NewDataTime newDataTime);
+void parseHtml(GumboNode* node, std::vector<WeatherDataPoint>& monthlyWeatherData, bool firstMonth, NewDataTime newDataTime);
 Result<WeatherDataPoint> getWeatherDataPoint(GumboNode* node);
+std::string quoteAfterNegativeNumber(std::string& str);
+
+Result<> writeWeatherExcel(ExcelConfig excelConfig, NewDataParams newDataParams, std::vector<WeatherDataPoint>& weatherData);
 
 Result<ExcelConfig> getExcelConfig() {
     xlnt::workbook wb;
@@ -125,7 +128,7 @@ Result<ExcelConfig> getExcelConfig() {
 
     std::string fileName;
     std::string sheetName;
-    int dateColIdx;
+    std::string dateColumnLetter;
     try {
         fileName = ws.cell(xlnt::cell_reference("A2")).to_string();
     } catch (const xlnt::exception& err) {
@@ -137,9 +140,9 @@ Result<ExcelConfig> getExcelConfig() {
         return Error{"Failed to get EXCEL_SHEET_NAME value : " + std::string(err.what())};
     }
     try {
-        dateColIdx = stoiDateColIdx(ws.cell(xlnt::cell_reference("C2")).to_string()).result();
+        dateColumnLetter = ws.cell(xlnt::cell_reference("C2")).to_string();
     } catch (const xlnt::exception& err) {
-        return Error{"Failed to get EXCEL_DATE_COL_IDX value : " + std::string(err.what())};
+        return Error{"Failed to get DATE_COLUMN_LETTER value : " + std::string(err.what())};
     }
 
     if (fileName.empty()) {
@@ -148,19 +151,17 @@ Result<ExcelConfig> getExcelConfig() {
     if (sheetName.empty()) {
         return Error{"EXCEL_SHEET_NAME value cannot be empty"};
     }
-
-    return ExcelConfig{fileName + ".xlsx", sheetName, dateColIdx};
-}
-
-Result<int> stoiDateColIdx(std::string val) {
-    try {
-        return std::stoi(val);
-    } catch (const std::invalid_argument& err) {
-        return Error{"Invalid date column index"};
+    if (dateColumnLetter.empty()) {
+        return Error{"DATE_COLUMN_LETTER value cannot be empty"};
     }
+    if (std::any_of(dateColumnLetter.begin(), dateColumnLetter.end(), ::isdigit)) {
+        return Error{"DATE_COLUMN_LETTER cannot contain numbers"};
+    }
+
+    return ExcelConfig{fileName + ".xlsx", sheetName, dateColumnLetter};
 }
 
-Result<NewDataParams> getNewDataParams(const ExcelConfig& excelConfig) {
+Result<NewDataParams> getNewDataParams(ExcelConfig excelConfig) {
     xlnt::workbook wb;
     try {
         wb.load(excelConfig.fileName);
@@ -176,12 +177,14 @@ Result<NewDataParams> getNewDataParams(const ExcelConfig& excelConfig) {
     }
 
     std::string lastDateStr;
-    int startingRowIdx = 1;
+    unsigned short startRowIdx = 1;
     for (auto row : ws.rows()) {
-        if (!row[excelConfig.dateColIdx].to_string().empty()) {
-            lastDateStr = row[excelConfig.dateColIdx].to_string();
+        xlnt::cell cell = ws.cell(excelConfig.dateColumnLetter + std::to_string(startRowIdx));
+        std::string val = cell.to_string();
+        if (!val.empty()) {
+            lastDateStr = val;
+            ++startRowIdx;
         }
-        ++startingRowIdx;
     }
 
     if (lastDateStr.empty()) {
@@ -189,10 +192,10 @@ Result<NewDataParams> getNewDataParams(const ExcelConfig& excelConfig) {
     }
 
     NewDataTime newDataTime = parseExcelDateStr(lastDateStr).result();
-    return NewDataParams{newDataTime, startingRowIdx};
+    return NewDataParams{newDataTime, startRowIdx};
 }
 
-Result<NewDataTime> parseExcelDateStr(const std::string& dateStr) {
+Result<NewDataTime> parseExcelDateStr(const std::string dateStr) {
     std::tm date = {};
     std::istringstream ss(dateStr);
     ss >> std::get_time(&date, "%d.%m.%Y");
@@ -201,8 +204,9 @@ Result<NewDataTime> parseExcelDateStr(const std::string& dateStr) {
     }
 
     std::time_t firstMonthTime = std::mktime(&date) + (24 * 60 * 60);
-    int firstMonthDay = date.tm_mday;
-    int presentMonthTime = getPresentMonthTime();
+    std::tm firstMonthDate = *std::localtime(&firstMonthTime);
+    unsigned short firstMonthDay = firstMonthDate.tm_mday;
+    time_t presentMonthTime = getPresentMonthTime();
 
     return NewDataTime{firstMonthTime, presentMonthTime, firstMonthDay};
 }
@@ -228,27 +232,28 @@ Result<std::vector<WeatherDataPoint>> getWeatherData(NewDataParams newDataParams
         return Error{"Failed to initialize CURL"};
     }
 
-    struct ResponseChunksBuffer responseChunksBuffer;
+    ResponseChunksBuffer responseChunksBuffer;
     curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, curlWriteFunction);
     curl_easy_setopt(curl, CURLOPT_WRITEDATA, &responseChunksBuffer);
 
     time_t monthTime = newDataParams.newDataTime.firstMonthTime;
     while (monthTime <= newDataParams.newDataTime.presentMonthTime) {
-        struct tm* monthDate = localtime(&monthTime);
+        std::tm monthDate = *localtime(&monthTime);
         std::ostringstream urlStream;
         urlStream << "https://freemeteo.ro/vremea/bucuroaia/istoric/istoric-lunar/?gid=683499&station=4621"
-                  << "&month=" << monthDate->tm_mon + 1
-                  << "&year=" << monthDate->tm_year + 1900
+                  << "&month=" << monthDate.tm_mon + 1
+                  << "&year=" << monthDate.tm_year + 1900
                   << "&language=romanian&country=romania";
         std::string url = urlStream.str();
         curl_easy_setopt(curl, CURLOPT_URL, url.c_str());
-        CURLcode res = curl_easy_perform(curl);
 
+        CURLcode res = curl_easy_perform(curl);
         if (res != CURLE_OK) {
             return Error{"CURL request failed : " + std::string(curl_easy_strerror(res))};
         }
 
-        std::vector<WeatherDataPoint> monthlyWeatherData = getMonthlyWeatherData(responseChunksBuffer.data()).result();
+        bool firstMonth = monthTime == newDataParams.newDataTime.firstMonthTime;
+        std::vector<WeatherDataPoint> monthlyWeatherData = getMonthlyWeatherData(responseChunksBuffer.data(), firstMonth, newDataParams.newDataTime).result();
         for (WeatherDataPoint dataPoint : monthlyWeatherData) {
             weatherData.push_back(dataPoint);
         }
@@ -269,21 +274,21 @@ size_t curlWriteFunction(void* contents, size_t size, size_t nmemb, void* userp)
     return addSize;
 }
 
-Result<std::vector<WeatherDataPoint>> getMonthlyWeatherData(const char* html) {
+Result<std::vector<WeatherDataPoint>> getMonthlyWeatherData(const char* html, bool firstMonth, NewDataTime newDataTime) {
     GumboOutput* output = gumbo_parse(html);
     if (!output) {
         return Error{"Failed to parse HTML"};
     }
 
     std::vector<WeatherDataPoint> monthlyWeatherData;
-    parseHtml(output->root, monthlyWeatherData);
+    parseHtml(output->root, monthlyWeatherData, firstMonth, newDataTime);
 
     gumbo_destroy_output(&kGumboDefaultOptions, output);
 
     return monthlyWeatherData;
 }
 
-void parseHtml(GumboNode* node, std::vector<WeatherDataPoint>& monthlyWeatherData) {
+void parseHtml(GumboNode* node, std::vector<WeatherDataPoint>& monthlyWeatherData, bool firstMonth, NewDataTime newDataTime) {
     if (!node || node->type != GUMBO_NODE_ELEMENT) {
         return;
     }
@@ -293,14 +298,17 @@ void parseHtml(GumboNode* node, std::vector<WeatherDataPoint>& monthlyWeatherDat
         if (!attr) {
             return;
         }
+        if (firstMonth && std::stoi(attr->value) < newDataTime.firstMonthDay) {
+            return;
+        }
 
         WeatherDataPoint weatherDataPoint = getWeatherDataPoint(node).result();
         monthlyWeatherData.push_back(weatherDataPoint);
     }
 
     GumboVector* children = &node->v.element.children;
-    for (unsigned int i = 0; i < children->length; ++i) {
-        parseHtml(static_cast<GumboNode*>(children->data[i]), monthlyWeatherData);
+    for (unsigned short i = 0; i < children->length; ++i) {
+        parseHtml(static_cast<GumboNode*>(children->data[i]), monthlyWeatherData, firstMonth, newDataTime);
     }
 }
 
@@ -316,7 +324,7 @@ Result<WeatherDataPoint> getWeatherDataPoint(GumboNode* node) {
 
     GumboVector* tdNodes = &node->v.element.children;
     // start with 1 and increment by 2 to jump over nodes of type GUMBO_NODE_WHITESPACE
-    for (unsigned int i = 1; i < tdNodes->length; i += 2) {
+    for (unsigned short i = 1; i < tdNodes->length; i += 2) {
         if (i == 15 || i == 17) {
             continue;
         }
@@ -334,7 +342,6 @@ Result<WeatherDataPoint> getWeatherDataPoint(GumboNode* node) {
         } else {
             textNode = static_cast<GumboNode*>(tdNode->v.element.children.data[0]);
         }
-
         if (!textNode) {
             return Error{"Failed to get text, website structure might have changed"};
         }
@@ -345,10 +352,10 @@ Result<WeatherDataPoint> getWeatherDataPoint(GumboNode* node) {
                 date = text;
                 break;
             case 3:
-                minTemperature = text;
+                minTemperature = quoteAfterNegativeNumber(text);
                 break;
             case 5:
-                maxTemperature = text;
+                maxTemperature = quoteAfterNegativeNumber(text);
                 break;
             case 7:
                 maxSustainedWind = text;
@@ -371,34 +378,57 @@ Result<WeatherDataPoint> getWeatherDataPoint(GumboNode* node) {
     return WeatherDataPoint{date, minTemperature, maxTemperature, maxSustainedWind, maxGustWind, rainfall, snowdepth, description};
 }
 
-int main() {
-    ExcelConfig excelConfig = getExcelConfig().result();
+std::string quoteAfterNegativeNumber(std::string& str) {
+    if (str[0] == '-') str.append("'");
+    return str;
+}
 
-    std::cout << excelConfig.fileName << std::endl;
-    std::cout << excelConfig.sheetName << std::endl;
-    std::cout << excelConfig.dateColIdx << std::endl
-              << std::endl;
-
-    NewDataParams newDataParams = getNewDataParams(excelConfig).result();
-
-    std::cout << newDataParams.newDataTime.firstMonthTime << std::endl;
-    std::cout << newDataParams.newDataTime.presentMonthTime << std::endl;
-    std::cout << newDataParams.newDataTime.firstMonthDay << std::endl
-              << std::endl;
-
-    std::vector<WeatherDataPoint> weatherData = getWeatherData(newDataParams).result();
-
-    for (WeatherDataPoint data : weatherData) {
-        std::cout << data.date << std::endl;
-        std::cout << data.minTemperature << std::endl;
-        std::cout << data.maxTemperature << std::endl;
-        std::cout << data.maxSustainedWind << std::endl;
-        std::cout << data.maxGustWind << std::endl;
-        std::cout << data.rainfall << std::endl;
-        std::cout << data.snowdepth << std::endl;
-        std::cout << data.description << std::endl
-                  << std::endl;
+Result<> writeWeatherExcel(ExcelConfig excelConfig, NewDataParams newDataParams, std::vector<WeatherDataPoint>& weatherData) {
+    xlnt::workbook wb;
+    try {
+        wb.load(excelConfig.fileName);
+    } catch (const xlnt::exception& err) {
+        return Error{"Failed to open " + excelConfig.fileName + " : " + std::string(err.what())};
     }
 
+    xlnt::worksheet ws;
+    try {
+        ws = wb.sheet_by_title(excelConfig.sheetName);
+    } catch (const xlnt::exception& err) {
+        return Error{"Failed to open sheet " + excelConfig.sheetName + " : " + std::string(err.what())};
+    }
+
+    unsigned short rowIdx = newDataParams.startRowIdx;
+    try {
+        for (WeatherDataPoint data : weatherData) {
+            xlnt::column_t column(excelConfig.dateColumnLetter);
+            ws.cell(xlnt::cell_reference(column++, rowIdx)).value(data.date);
+            ws.cell(xlnt::cell_reference(column++, rowIdx)).value(data.minTemperature);
+            ws.cell(xlnt::cell_reference(column++, rowIdx)).value(data.maxTemperature);
+            ws.cell(xlnt::cell_reference(column++, rowIdx)).value(data.maxSustainedWind);
+            ws.cell(xlnt::cell_reference(column++, rowIdx)).value(data.maxGustWind);
+            ws.cell(xlnt::cell_reference(column++, rowIdx)).value(data.rainfall);
+            ws.cell(xlnt::cell_reference(column++, rowIdx)).value(data.snowdepth);
+            ws.cell(xlnt::cell_reference(column, rowIdx)).value(data.description);
+            ++rowIdx;
+        }
+    } catch (const xlnt::exception& err) {
+        return Error{"Failed to write data at row " + std::to_string(rowIdx) + " : " + std::string(err.what())};
+    }
+
+    try {
+        wb.save(excelConfig.fileName);
+    } catch (const xlnt::exception& err) {
+        return Error{"Failed to save " + excelConfig.fileName + " : " + std::string(err.what())};
+    }
+
+    return {};
+}
+
+int main() {
+    ExcelConfig excelConfig = getExcelConfig().result();
+    NewDataParams newDataParams = getNewDataParams(excelConfig).result();
+    std::vector<WeatherDataPoint> weatherData = getWeatherData(newDataParams).result();
+    writeWeatherExcel(excelConfig, newDataParams, weatherData).result();
     return 0;
 }
