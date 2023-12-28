@@ -64,6 +64,17 @@ struct NewDataParams {
     const int startRowIdx;
 };
 
+struct WeatherDataPoint {
+    const std::string date;
+    const std::string minTemperature;
+    const std::string maxTemperature;
+    const std::string maxSustainedWind;
+    const std::string maxGustWind;
+    const std::string rainfall;
+    const std::string snowdepth;
+    const std::string description;
+};
+
 struct ResponseChunksBuffer {
     std::vector<char> buffer;
 
@@ -91,10 +102,11 @@ Result<NewDataParams> getNewDataParams(const ExcelConfig& excelConfig);
 Result<NewDataTime> parseExcelDateStr(const std::string& dateStr);
 time_t getPresentMonthTime();
 
-Result<> requestNewData(NewDataParams newDataParams);
+Result<std::vector<WeatherDataPoint>> getWeatherData(NewDataParams newDataParams);
 size_t curlWriteFunction(void* contents, size_t size, size_t nmemb, void* userp);
-void parseHtml(const char* html);
-void searchNodes(GumboNode* node);
+Result<std::vector<WeatherDataPoint>> getMonthlyWeatherData(const char* html);
+void parseHtml(GumboNode* node, std::vector<WeatherDataPoint>& monthlyWeatherData);
+Result<WeatherDataPoint> getWeatherDataPoint(GumboNode* node);
 
 Result<ExcelConfig> getExcelConfig() {
     xlnt::workbook wb;
@@ -208,7 +220,9 @@ time_t getPresentMonthTime() {
     return std::mktime(&now);
 }
 
-Result<> requestNewData(NewDataParams newDataParams) {
+Result<std::vector<WeatherDataPoint>> getWeatherData(NewDataParams newDataParams) {
+    std::vector<WeatherDataPoint> weatherData;
+
     CURL* curl = curl_easy_init();
     if (!curl) {
         return Error{"Failed to initialize CURL"};
@@ -234,7 +248,10 @@ Result<> requestNewData(NewDataParams newDataParams) {
             return Error{"CURL request failed : " + std::string(curl_easy_strerror(res))};
         }
 
-        parseHtml(responseChunksBuffer.data());
+        std::vector<WeatherDataPoint> monthlyWeatherData = getMonthlyWeatherData(responseChunksBuffer.data()).result();
+        for (WeatherDataPoint dataPoint : monthlyWeatherData) {
+            weatherData.push_back(dataPoint);
+        }
         responseChunksBuffer.clear();
 
         monthTime += (30 * 24 * 60 * 60);
@@ -242,7 +259,7 @@ Result<> requestNewData(NewDataParams newDataParams) {
 
     curl_easy_cleanup(curl);
 
-    return {};
+    return weatherData;
 }
 
 size_t curlWriteFunction(void* contents, size_t size, size_t nmemb, void* userp) {
@@ -252,13 +269,21 @@ size_t curlWriteFunction(void* contents, size_t size, size_t nmemb, void* userp)
     return addSize;
 }
 
-void parseHtml(const char* html) {
+Result<std::vector<WeatherDataPoint>> getMonthlyWeatherData(const char* html) {
     GumboOutput* output = gumbo_parse(html);
-    searchNodes(output->root);
+    if (!output) {
+        return Error{"Failed to parse HTML"};
+    }
+
+    std::vector<WeatherDataPoint> monthlyWeatherData;
+    parseHtml(output->root, monthlyWeatherData);
+
     gumbo_destroy_output(&kGumboDefaultOptions, output);
+
+    return monthlyWeatherData;
 }
 
-void searchNodes(GumboNode* node) {
+void parseHtml(GumboNode* node, std::vector<WeatherDataPoint>& monthlyWeatherData) {
     if (!node || node->type != GUMBO_NODE_ELEMENT) {
         return;
     }
@@ -269,28 +294,81 @@ void searchNodes(GumboNode* node) {
             return;
         }
 
-        GumboVector* tdNodes = &node->v.element.children;
-        // start with 1 and increment by 2 to jump over nodes of type GUMBO_NODE_WHITESPACE
-        for (unsigned int i = 1; i < tdNodes->length; i += 2) {
-            GumboNode* tdNode = static_cast<GumboNode*>(tdNodes->data[i]);
-            GumboNode* textNode;
-            if (i == 1) {
-                GumboNode* anchorNode = static_cast<GumboNode*>(tdNode->v.element.children.data[0]);
-                textNode = static_cast<GumboNode*>(anchorNode->v.element.children.data[0]);
-                std::cout << textNode->v.text.text << std::endl;
-            } else if (i != 17) {
-                textNode = static_cast<GumboNode*>(tdNode->v.element.children.data[0]);
-                std::cout << textNode->v.text.text << std::endl;
-            }
-        }
-
-        std::cout << std::endl;
+        WeatherDataPoint weatherDataPoint = getWeatherDataPoint(node).result();
+        monthlyWeatherData.push_back(weatherDataPoint);
     }
 
     GumboVector* children = &node->v.element.children;
     for (unsigned int i = 0; i < children->length; ++i) {
-        searchNodes(static_cast<GumboNode*>(children->data[i]));
+        parseHtml(static_cast<GumboNode*>(children->data[i]), monthlyWeatherData);
     }
+}
+
+Result<WeatherDataPoint> getWeatherDataPoint(GumboNode* node) {
+    std::string date;
+    std::string minTemperature;
+    std::string maxTemperature;
+    std::string maxSustainedWind;
+    std::string maxGustWind;
+    std::string rainfall;
+    std::string snowdepth;
+    std::string description;
+
+    GumboVector* tdNodes = &node->v.element.children;
+    // start with 1 and increment by 2 to jump over nodes of type GUMBO_NODE_WHITESPACE
+    for (unsigned int i = 1; i < tdNodes->length; i += 2) {
+        if (i == 15 || i == 17) {
+            continue;
+        }
+
+        GumboNode* tdNode = static_cast<GumboNode*>(tdNodes->data[i]);
+        if (!tdNode) {
+            return Error{"Failed to get TD node, website structure might have changed"};
+        }
+
+        GumboNode* textNode;
+        // the date is an anchor node
+        if (i == 1) {
+            GumboNode* anchorNode = static_cast<GumboNode*>(tdNode->v.element.children.data[0]);
+            textNode = static_cast<GumboNode*>(anchorNode->v.element.children.data[0]);
+        } else {
+            textNode = static_cast<GumboNode*>(tdNode->v.element.children.data[0]);
+        }
+
+        if (!textNode) {
+            return Error{"Failed to get text, website structure might have changed"};
+        }
+
+        std::string text = textNode->v.text.text;
+        switch (i) {
+            case 1:
+                date = text;
+                break;
+            case 3:
+                minTemperature = text;
+                break;
+            case 5:
+                maxTemperature = text;
+                break;
+            case 7:
+                maxSustainedWind = text;
+                break;
+            case 9:
+                maxGustWind = text;
+                break;
+            case 11:
+                rainfall = text;
+                break;
+            case 13:
+                snowdepth = text;
+                break;
+            case 19:
+                description = text;
+                break;
+        }
+    }
+
+    return WeatherDataPoint{date, minTemperature, maxTemperature, maxSustainedWind, maxGustWind, rainfall, snowdepth, description};
 }
 
 int main() {
@@ -308,7 +386,19 @@ int main() {
     std::cout << newDataParams.newDataTime.firstMonthDay << std::endl
               << std::endl;
 
-    requestNewData(newDataParams).result();
+    std::vector<WeatherDataPoint> weatherData = getWeatherData(newDataParams).result();
+
+    for (WeatherDataPoint data : weatherData) {
+        std::cout << data.date << std::endl;
+        std::cout << data.minTemperature << std::endl;
+        std::cout << data.maxTemperature << std::endl;
+        std::cout << data.maxSustainedWind << std::endl;
+        std::cout << data.maxGustWind << std::endl;
+        std::cout << data.rainfall << std::endl;
+        std::cout << data.snowdepth << std::endl;
+        std::cout << data.description << std::endl
+                  << std::endl;
+    }
 
     return 0;
 }
