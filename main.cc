@@ -1,5 +1,6 @@
 #include <curl/curl.h>
 #include <gumbo.h>
+#include <windows.h>
 
 #include <algorithm>
 #include <chrono>
@@ -21,9 +22,14 @@ struct Error {
     }
 
     void print() const {
-        const char redColor[6] = "\033[31m";
-        const char resetColor[6] = "\033[0m";
-        std::cerr << redColor << "Error : " << msg << resetColor << std::endl;
+        setColor(FOREGROUND_RED);
+        std::cerr << "Error : " << msg << std::endl;
+        setColor();
+    }
+
+    void setColor(int color = FOREGROUND_RED | FOREGROUND_GREEN | FOREGROUND_BLUE) const {
+        HANDLE hConsole = GetStdHandle(STD_OUTPUT_HANDLE);
+        SetConsoleTextAttribute(hConsole, color);
     }
 };
 
@@ -100,7 +106,7 @@ Result<ExcelConfig> getExcelConfig();
 
 Result<NewDataParams> getNewDataParams(ExcelConfig excelConfig);
 Result<NewDataTime> parseExcelDateStr(const std::string dateStr);
-void normalizeDateTime(std::tm& dateTime);
+std::tm normalizedDateTime(std::tm dateTime);
 time_t getPresentMonthTime();
 
 Result<std::vector<WeatherDataPoint>> getWeatherData(NewDataParams newDataParams);
@@ -117,15 +123,15 @@ Result<ExcelConfig> getExcelConfig() {
     xlnt::workbook wb;
     try {
         wb.load("config.xlsx");
-    } catch (const xlnt::exception& err) {
-        return Error{"Failed to open config.xlsx : " + std::string(err.what())};
+    } catch (const std::exception& err) {
+        return Error{"Failed to open config.xlsx : " + std::string(err.what()) + "\nMake sure file config.xlsx exists or is in the same folder as the executable"};
     }
 
     xlnt::worksheet ws;
     try {
         ws = wb.sheet_by_title("Config");
-    } catch (const xlnt::exception& err) {
-        return Error{"Failed to get sheet Config : " + std::string(err.what())};
+    } catch (const std::exception& err) {
+        return Error{"Failed to get sheet Config : " + std::string(err.what()) + "\nMake sure the sheet is named Config"};
     }
 
     std::string fileName;
@@ -133,7 +139,7 @@ Result<ExcelConfig> getExcelConfig() {
     std::string dateColumnLetter;
     try {
         fileName = ws.cell(xlnt::cell_reference("A2")).to_string();
-    } catch (const xlnt::exception& err) {
+    } catch (const std::exception& err) {
         return Error{"Failed to get EXCEL_FILE_NAME value : " + std::string(err.what())};
     }
     try {
@@ -148,13 +154,13 @@ Result<ExcelConfig> getExcelConfig() {
     }
 
     if (fileName.empty()) {
-        return Error{"EXCEL_FILE_NAME value cannot be empty"};
+        return Error{"EXCEL_FILE_NAME value cannot be empty\nMake sure the value is in cell A2 of the Config sheet"};
     }
     if (sheetName.empty()) {
-        return Error{"EXCEL_SHEET_NAME value cannot be empty"};
+        return Error{"EXCEL_SHEET_NAME value cannot be empty\nMake sure the value is in cell B2 of the Config sheet"};
     }
     if (dateColumnLetter.empty()) {
-        return Error{"DATE_COLUMN_LETTER value cannot be empty"};
+        return Error{"DATE_COLUMN_LETTER value cannot be empty\nMake sure the value is in cell C2 of the Config sheet"};
     }
     if (std::any_of(dateColumnLetter.begin(), dateColumnLetter.end(), ::isdigit)) {
         return Error{"DATE_COLUMN_LETTER cannot contain numbers"};
@@ -167,15 +173,15 @@ Result<NewDataParams> getNewDataParams(ExcelConfig excelConfig) {
     xlnt::workbook wb;
     try {
         wb.load(excelConfig.fileName);
-    } catch (const xlnt::exception& err) {
-        return Error{"Failed to open " + excelConfig.fileName + " : " + std::string(err.what())};
+    } catch (const std::exception& err) {
+        return Error{"Failed to open " + excelConfig.fileName + " : " + std::string(err.what()) + "\nMake sure file " + excelConfig.fileName + " exists or is in the same folder as the executable"};
     }
 
     xlnt::worksheet ws;
     try {
         ws = wb.sheet_by_title(excelConfig.sheetName);
-    } catch (const xlnt::exception& err) {
-        return Error{"Failed to open sheet " + excelConfig.sheetName + " : " + std::string(err.what())};
+    } catch (const std::exception& err) {
+        return Error{"Failed to open sheet " + excelConfig.sheetName + " : " + std::string(err.what()) + "\nMake sure sheet " + excelConfig.sheetName + " exists"};
     }
 
     std::string lastDateStr;
@@ -190,7 +196,7 @@ Result<NewDataParams> getNewDataParams(ExcelConfig excelConfig) {
     }
 
     if (lastDateStr.empty()) {
-        return Error{"Last date value not found"};
+        return Error{"Last date value not found\nMake sure column " + excelConfig.dateColumnLetter + " has a value"};
     }
 
     NewDataTime newDataTime = parseExcelDateStr(lastDateStr).result();
@@ -202,9 +208,9 @@ Result<NewDataTime> parseExcelDateStr(const std::string dateStr) {
     std::istringstream ss(dateStr);
     ss >> std::get_time(&dateTime, "%d.%m.%Y");
     if (ss.fail()) {
-        return Error{"Failed to parse date : " + dateStr};
+        return Error{"Failed to parse date : " + dateStr + "\nMake sure the date is in format DD.MM.YYYY"};
     }
-    normalizeDateTime(dateTime);
+    dateTime = normalizedDateTime(dateTime);
 
     std::time_t firstMonthTime = std::mktime(&dateTime) + (24 * 60 * 60);
     std::tm firstMonthDateTime = *std::localtime(&firstMonthTime);
@@ -216,20 +222,20 @@ Result<NewDataTime> parseExcelDateStr(const std::string dateStr) {
     return NewDataTime{firstMonthTime, presentMonthTime, firstMonthDay};
 }
 
-void normalizeDateTime(std::tm& dateTime) {
+std::tm normalizedDateTime(std::tm dateTime) {
     dateTime.tm_sec = 0;
     dateTime.tm_min = 0;
     dateTime.tm_hour = 0;
     dateTime.tm_wday = 0;
     dateTime.tm_yday = 0;
     dateTime.tm_isdst = 0;
+    return dateTime;
 }
 
 time_t getPresentMonthTime() {
     auto chronoNow = std::chrono::system_clock::now();
     std::time_t nowTime = std::chrono::system_clock::to_time_t(chronoNow);
-    std::tm nowDateTime = *std::localtime(&nowTime);
-    normalizeDateTime(nowDateTime);
+    std::tm nowDateTime = normalizedDateTime(*std::localtime(&nowTime));
     return std::mktime(&nowDateTime);
 }
 
@@ -409,15 +415,15 @@ Result<> writeWeatherExcel(ExcelConfig excelConfig, NewDataParams newDataParams,
     xlnt::workbook wb;
     try {
         wb.load(excelConfig.fileName);
-    } catch (const xlnt::exception& err) {
-        return Error{"Failed to open " + excelConfig.fileName + " : " + std::string(err.what())};
+    } catch (const std::exception& err) {
+        return Error{"Failed to open " + excelConfig.fileName + " : " + std::string(err.what()) + "\nMake sure file " + excelConfig.fileName + " exists or is in the same folder as the executable"};
     }
 
     xlnt::worksheet ws;
     try {
         ws = wb.sheet_by_title(excelConfig.sheetName);
-    } catch (const xlnt::exception& err) {
-        return Error{"Failed to open sheet " + excelConfig.sheetName + " : " + std::string(err.what())};
+    } catch (const std::exception& err) {
+        return Error{"Failed to open sheet " + excelConfig.sheetName + " : " + std::string(err.what()) + "\nMake sure sheet " + excelConfig.sheetName + " exists"};
     }
 
     unsigned short rowIdx = newDataParams.startRowIdx;
@@ -434,14 +440,14 @@ Result<> writeWeatherExcel(ExcelConfig excelConfig, NewDataParams newDataParams,
             ws.cell(xlnt::cell_reference(column, rowIdx)).value(data.description);
             ++rowIdx;
         }
-    } catch (const xlnt::exception& err) {
+    } catch (const std::exception& err) {
         return Error{"Failed to write data at row " + std::to_string(rowIdx) + " : " + std::string(err.what())};
     }
 
     try {
         wb.save(excelConfig.fileName);
-    } catch (const xlnt::exception& err) {
-        return Error{"Failed to save " + excelConfig.fileName + " : " + std::string(err.what())};
+    } catch (const std::exception& err) {
+        return Error{"Failed to save " + excelConfig.fileName + " : " + std::string(err.what()) + "\nMake sure  the file " + excelConfig.fileName + " is not open"};
     }
 
     return {};
