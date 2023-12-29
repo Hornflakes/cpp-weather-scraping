@@ -1,6 +1,5 @@
 #include <curl/curl.h>
 #include <gumbo.h>
-#include <windows.h>
 
 #include <algorithm>
 #include <chrono>
@@ -13,6 +12,10 @@
 #include <vector>
 #include <xlnt/xlnt.hpp>
 
+#ifdef _WIN32
+#include <windows.h>
+#endif
+
 struct Error {
     const std::string msg;
 
@@ -21,6 +24,7 @@ struct Error {
         exit(1);
     }
 
+#ifdef _WIN32
     void print() const {
         setColor(FOREGROUND_RED);
         std::cerr << "Error : " << msg << std::endl;
@@ -31,6 +35,13 @@ struct Error {
         HANDLE hConsole = GetStdHandle(STD_OUTPUT_HANDLE);
         SetConsoleTextAttribute(hConsole, color);
     }
+#else
+    void print() const {
+        const char redColor[6] = "\033[31m";
+        const char resetColor[6] = "\033[0m";
+        std::cerr << redColor << "Error : " << msg << resetColor << std::endl;
+    }
+#endif
 };
 
 template <typename T = std::monostate>
