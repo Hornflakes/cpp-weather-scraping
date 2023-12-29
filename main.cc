@@ -100,12 +100,14 @@ Result<ExcelConfig> getExcelConfig();
 
 Result<NewDataParams> getNewDataParams(ExcelConfig excelConfig);
 Result<NewDataTime> parseExcelDateStr(const std::string dateStr);
+void normalizeDateTime(std::tm& dateTime);
 time_t getPresentMonthTime();
 
 Result<std::vector<WeatherDataPoint>> getWeatherData(NewDataParams newDataParams);
+time_t addOneMonth(time_t time);
 size_t curlWriteFunction(void* contents, size_t size, size_t nmemb, void* userp);
-Result<std::vector<WeatherDataPoint>> getMonthlyWeatherData(const char* html, bool firstMonth, NewDataTime newDataTime);
-void parseHtml(GumboNode* node, std::vector<WeatherDataPoint>& monthlyWeatherData, bool firstMonth, NewDataTime newDataTime);
+Result<std::vector<WeatherDataPoint>> getMonthlyWeatherData(const char* html, bool isFirstMonth, NewDataTime newDataTime);
+void parseHtml(GumboNode* node, std::vector<WeatherDataPoint>& monthlyWeatherData, bool isFirstMonth, NewDataTime newDataTime);
 Result<WeatherDataPoint> getWeatherDataPoint(GumboNode* node);
 std::string quoteAfterNegativeNumber(std::string& str);
 
@@ -177,13 +179,13 @@ Result<NewDataParams> getNewDataParams(ExcelConfig excelConfig) {
     }
 
     std::string lastDateStr;
-    unsigned short startRowIdx = 1;
-    for (auto row : ws.rows()) {
-        xlnt::cell cell = ws.cell(excelConfig.dateColumnLetter + std::to_string(startRowIdx));
+    unsigned short rowIdx = ws.highest_row();
+    for (; rowIdx > 1; --rowIdx) {
+        xlnt::cell cell = ws.cell(excelConfig.dateColumnLetter + std::to_string(rowIdx));
         std::string val = cell.to_string();
         if (!val.empty()) {
             lastDateStr = val;
-            ++startRowIdx;
+            break;
         }
     }
 
@@ -192,36 +194,43 @@ Result<NewDataParams> getNewDataParams(ExcelConfig excelConfig) {
     }
 
     NewDataTime newDataTime = parseExcelDateStr(lastDateStr).result();
-    return NewDataParams{newDataTime, startRowIdx};
+    return NewDataParams{newDataTime, ++rowIdx};
 }
 
 Result<NewDataTime> parseExcelDateStr(const std::string dateStr) {
-    std::tm date = {};
+    std::tm dateTime = {};
     std::istringstream ss(dateStr);
-    ss >> std::get_time(&date, "%d.%m.%Y");
+    ss >> std::get_time(&dateTime, "%d.%m.%Y");
     if (ss.fail()) {
         return Error{"Failed to parse date : " + dateStr};
     }
+    normalizeDateTime(dateTime);
 
-    std::time_t firstMonthTime = std::mktime(&date) + (24 * 60 * 60);
-    std::tm firstMonthDate = *std::localtime(&firstMonthTime);
-    unsigned short firstMonthDay = firstMonthDate.tm_mday;
+    std::time_t firstMonthTime = std::mktime(&dateTime) + (24 * 60 * 60);
+    std::tm firstMonthDateTime = *std::localtime(&firstMonthTime);
+    unsigned short firstMonthDay = firstMonthDateTime.tm_mday;
+    // firstMonthDateTime set to first day of the month to later add months without edge cases
+    firstMonthDateTime.tm_mday = 1;
     time_t presentMonthTime = getPresentMonthTime();
 
     return NewDataTime{firstMonthTime, presentMonthTime, firstMonthDay};
 }
 
+void normalizeDateTime(std::tm& dateTime) {
+    dateTime.tm_sec = 0;
+    dateTime.tm_min = 0;
+    dateTime.tm_hour = 0;
+    dateTime.tm_wday = 0;
+    dateTime.tm_yday = 0;
+    dateTime.tm_isdst = 0;
+}
+
 time_t getPresentMonthTime() {
     auto chronoNow = std::chrono::system_clock::now();
     std::time_t nowTime = std::chrono::system_clock::to_time_t(chronoNow);
-    std::tm now = *std::localtime(&nowTime);
-    now.tm_sec = 0;
-    now.tm_min = 0;
-    now.tm_hour = 0;
-    now.tm_wday = 0;
-    now.tm_yday = 0;
-    now.tm_isdst = 0;
-    return std::mktime(&now);
+    std::tm nowDateTime = *std::localtime(&nowTime);
+    normalizeDateTime(nowDateTime);
+    return std::mktime(&nowDateTime);
 }
 
 Result<std::vector<WeatherDataPoint>> getWeatherData(NewDataParams newDataParams) {
@@ -236,35 +245,47 @@ Result<std::vector<WeatherDataPoint>> getWeatherData(NewDataParams newDataParams
     curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, curlWriteFunction);
     curl_easy_setopt(curl, CURLOPT_WRITEDATA, &responseChunksBuffer);
 
+    std::ostringstream urlStream;
     time_t monthTime = newDataParams.newDataTime.firstMonthTime;
     while (monthTime <= newDataParams.newDataTime.presentMonthTime) {
         std::tm monthDate = *localtime(&monthTime);
-        std::ostringstream urlStream;
         urlStream << "https://freemeteo.ro/vremea/bucuroaia/istoric/istoric-lunar/?gid=683499&station=4621"
                   << "&month=" << monthDate.tm_mon + 1
                   << "&year=" << monthDate.tm_year + 1900
                   << "&language=romanian&country=romania";
         std::string url = urlStream.str();
-        curl_easy_setopt(curl, CURLOPT_URL, url.c_str());
+        urlStream.str("");
+        urlStream.clear();
 
+        curl_easy_setopt(curl, CURLOPT_URL, url.c_str());
         CURLcode res = curl_easy_perform(curl);
         if (res != CURLE_OK) {
             return Error{"CURL request failed : " + std::string(curl_easy_strerror(res))};
         }
 
-        bool firstMonth = monthTime == newDataParams.newDataTime.firstMonthTime;
-        std::vector<WeatherDataPoint> monthlyWeatherData = getMonthlyWeatherData(responseChunksBuffer.data(), firstMonth, newDataParams.newDataTime).result();
+        bool isFirstMonth = monthTime == newDataParams.newDataTime.firstMonthTime;
+        std::vector<WeatherDataPoint> monthlyWeatherData = getMonthlyWeatherData(responseChunksBuffer.data(), isFirstMonth, newDataParams.newDataTime).result();
         for (WeatherDataPoint dataPoint : monthlyWeatherData) {
             weatherData.push_back(dataPoint);
         }
         responseChunksBuffer.clear();
 
-        monthTime += (30 * 24 * 60 * 60);
+        monthTime = addOneMonth(monthTime);
     }
 
     curl_easy_cleanup(curl);
 
     return weatherData;
+}
+
+time_t addOneMonth(time_t time) {
+    std::tm dateTime = *std::localtime(&time);
+    dateTime.tm_mon += 1;
+    if (dateTime.tm_mon > 11) {
+        dateTime.tm_mon = 0;
+        dateTime.tm_year += 1;
+    }
+    return std::mktime(&dateTime);
 }
 
 size_t curlWriteFunction(void* contents, size_t size, size_t nmemb, void* userp) {
@@ -274,21 +295,22 @@ size_t curlWriteFunction(void* contents, size_t size, size_t nmemb, void* userp)
     return addSize;
 }
 
-Result<std::vector<WeatherDataPoint>> getMonthlyWeatherData(const char* html, bool firstMonth, NewDataTime newDataTime) {
+Result<std::vector<WeatherDataPoint>> getMonthlyWeatherData(const char* html, bool isFirstMonth, NewDataTime newDataTime) {
     GumboOutput* output = gumbo_parse(html);
     if (!output) {
         return Error{"Failed to parse HTML"};
     }
 
     std::vector<WeatherDataPoint> monthlyWeatherData;
-    parseHtml(output->root, monthlyWeatherData, firstMonth, newDataTime);
+    monthlyWeatherData.reserve(31);
+    parseHtml(output->root, monthlyWeatherData, isFirstMonth, newDataTime);
 
     gumbo_destroy_output(&kGumboDefaultOptions, output);
 
     return monthlyWeatherData;
 }
 
-void parseHtml(GumboNode* node, std::vector<WeatherDataPoint>& monthlyWeatherData, bool firstMonth, NewDataTime newDataTime) {
+void parseHtml(GumboNode* node, std::vector<WeatherDataPoint>& monthlyWeatherData, bool isFirstMonth, NewDataTime newDataTime) {
     if (!node || node->type != GUMBO_NODE_ELEMENT) {
         return;
     }
@@ -298,7 +320,7 @@ void parseHtml(GumboNode* node, std::vector<WeatherDataPoint>& monthlyWeatherDat
         if (!attr) {
             return;
         }
-        if (firstMonth && std::stoi(attr->value) < newDataTime.firstMonthDay) {
+        if (isFirstMonth && std::stoi(attr->value) < newDataTime.firstMonthDay) {
             return;
         }
 
@@ -308,7 +330,7 @@ void parseHtml(GumboNode* node, std::vector<WeatherDataPoint>& monthlyWeatherDat
 
     GumboVector* children = &node->v.element.children;
     for (unsigned short i = 0; i < children->length; ++i) {
-        parseHtml(static_cast<GumboNode*>(children->data[i]), monthlyWeatherData, firstMonth, newDataTime);
+        parseHtml(static_cast<GumboNode*>(children->data[i]), monthlyWeatherData, isFirstMonth, newDataTime);
     }
 }
 
