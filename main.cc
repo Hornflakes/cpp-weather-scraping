@@ -114,6 +114,7 @@ struct ResponseChunksBuffer {
 };
 
 Result<ExcelConfig> getExcelConfig();
+std::string excelPath(const std::string fileName);
 
 Result<NewDataParams> getNewDataParams(ExcelConfig excelConfig);
 Result<NewDataTime> parseExcelDateStr(const std::string dateStr);
@@ -133,7 +134,7 @@ Result<> writeWeatherExcel(ExcelConfig excelConfig, NewDataParams newDataParams,
 Result<ExcelConfig> getExcelConfig() {
     xlnt::workbook wb;
     try {
-        wb.load("config.xlsx");
+        wb.load(excelPath("config.xlsx"));
     } catch (const std::exception& err) {
         return Error{"Failed to open config.xlsx : " + std::string(err.what()) + "\nMake sure file config.xlsx exists or is in the same folder as the executable"};
     }
@@ -180,10 +181,14 @@ Result<ExcelConfig> getExcelConfig() {
     return ExcelConfig{fileName + ".xlsx", sheetName, dateColumnLetter};
 }
 
+std::string excelPath(const std::string fileName) {
+    return "./excels/" + fileName;
+}
+
 Result<NewDataParams> getNewDataParams(ExcelConfig excelConfig) {
     xlnt::workbook wb;
     try {
-        wb.load(excelConfig.fileName);
+        wb.load(excelPath(excelConfig.fileName));
     } catch (const std::exception& err) {
         return Error{"Failed to open " + excelConfig.fileName + " : " + std::string(err.what()) + "\nMake sure file " + excelConfig.fileName + " exists or is in the same folder as the executable"};
     }
@@ -259,6 +264,7 @@ Result<std::vector<WeatherDataPoint>> getWeatherData(NewDataParams newDataParams
     }
 
     ResponseChunksBuffer responseChunksBuffer;
+    curl_easy_setopt(curl, CURLOPT_CAINFO, "./certs/cacert-2023-12-12.pem");
     curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, curlWriteFunction);
     curl_easy_setopt(curl, CURLOPT_WRITEDATA, &responseChunksBuffer);
 
@@ -425,7 +431,7 @@ std::string quoteAfterNegativeNumber(std::string& str) {
 Result<> writeWeatherExcel(ExcelConfig excelConfig, NewDataParams newDataParams, std::vector<WeatherDataPoint>& weatherData) {
     xlnt::workbook wb;
     try {
-        wb.load(excelConfig.fileName);
+        wb.load(excelPath(excelConfig.fileName));
     } catch (const std::exception& err) {
         return Error{"Failed to open " + excelConfig.fileName + " : " + std::string(err.what()) + "\nMake sure file " + excelConfig.fileName + " exists or is in the same folder as the executable"};
     }
@@ -456,7 +462,7 @@ Result<> writeWeatherExcel(ExcelConfig excelConfig, NewDataParams newDataParams,
     }
 
     try {
-        wb.save(excelConfig.fileName);
+        wb.save(excelPath(excelConfig.fileName));
     } catch (const std::exception& err) {
         return Error{"Failed to save " + excelConfig.fileName + " : " + std::string(err.what()) + "\nMake sure  the file " + excelConfig.fileName + " is not open"};
     }
@@ -465,6 +471,7 @@ Result<> writeWeatherExcel(ExcelConfig excelConfig, NewDataParams newDataParams,
 }
 
 int main() {
+    std::cout << "Weather scraping . . ." << std::endl;
     ExcelConfig excelConfig = getExcelConfig().result();
     NewDataParams newDataParams = getNewDataParams(excelConfig).result();
     std::vector<WeatherDataPoint> weatherData = getWeatherData(newDataParams).result();
