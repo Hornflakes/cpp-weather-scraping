@@ -47,3 +47,9 @@ This C++ version is also an attempt at adopting (dys)functional programming prin
     or `weather_script.bat` (leaves the Command Prompt open, you can see errors like this)
 
 6. PROFIT 📈📈📈
+
+##
+
+The CA certificate for the data request can expire. In that case, you can replace it.
+
+The certificate is in the `certs` folder. [You can download certificates here.](https://curl.se/docs/caextract.html)
