@@ -1,5 +1,5 @@
 @echo off
-weather_script.exe
+%~dp0app/weather_script.exe
 if %ERRORLEVEL% NEQ 0 (
 	pause
 ) 

@@ -1,6 +1,6 @@
 # fast-weather-scraping
 
-This repo contains a weather web scraping C++ script (code, .exe and .bat) I made for my dad.
+This repo contains a weather web scraping C++ script (code and .bat) I made for my dad.
 
 He records and analyzes weather data for our orchard. 🍇🌳🍐🍑🍎🍒
 
@@ -14,6 +14,8 @@ This C++ version is also an attempt at adopting (dys)functional programming prin
 -   exports the data into Excel
 
 ## Setup
+
+Make sure the excel files are in the same folder from which you run the script (be it .exe or .bat).
 
 **Dev:**
 
@@ -42,10 +44,7 @@ This C++ version is also an attempt at adopting (dys)functional programming prin
     - your sheet name
     - the letter(s) header of the first (date) column
 
-5. run `weather_script.exe`
-
-    or `weather_script.bat` (leaves the Command Prompt open, you can see errors like this)
-
+5. run `weather_script.bat` and wait for the console window to close
 6. PROFIT 📈📈📈
 
 ##
